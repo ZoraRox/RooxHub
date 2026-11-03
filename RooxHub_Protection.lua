@@ -46,16 +46,50 @@ return function(deps)
         return true
     end
 
+    -- ======================= ANTI-AFK =======================
+    -- Layered anti-AFK that works on PC and on mobile executors (Delta, Arceus, ...).
+    --  Layer 1 generic : kill the game's AFK LocalScript + all Idled connections.
+    --  Layer 2 generic : real input replay (VirtualUser + firesignal where the executor
+    --                    actually implements it) so games that time their own idle reset.
+    --  Layer 3 per-game: "Steal A Pet And Ride It" puts its own AFK timeout in the
+    --                    Workspace "TestAfk" attribute and its AfkController re-reads it
+    --                    every second, so pushing that attribute out neutralises the game's
+    --                    custom 16-minute rejoin with no hooking at all. A global
+    --                    __namecall hook to block its AfkRejoin remote was tried and
+    --                    deliberately removed: it destabilises/wedges the client.
+    local afkState = {
+        enabled = false,
+        running = false,
+        thread = nil,
+        idledConn = nil,
+    }
+
+    local function disableIdledConnections()
+        pcall(function()
+            if not getconnections then return end
+            local conns = getconnections(LocalPlayer.Idled)
+            if not conns then return end
+            for _, conn in ipairs(conns) do
+                if conn.Disable then
+                    pcall(function() conn:Disable() end)
+                elseif conn.Disconnect then
+                    pcall(function() conn:Disconnect() end)
+                end
+            end
+        end)
+    end
+
     function M.bypassGameAFK()
         pcall(function()
-            local afk = LocalPlayer:WaitForChild("PlayerScripts", 5) and LocalPlayer.PlayerScripts:FindFirstChild("AFK")
+            local ps = LocalPlayer:FindFirstChild("PlayerScripts")
+            local afk = ps and ps:FindFirstChild("AFK")
             if afk then
-                afk.Disabled = true
-                afk:Destroy()
+                pcall(function() afk.Disabled = true end)
+                pcall(function() afk:Destroy() end)
             end
         end)
         pcall(function()
-            if not Connections.AFKWatcher then
+            if not Connections.AFKWatcher and LocalPlayer:FindFirstChild("PlayerScripts") then
                 Connections.AFKWatcher = LocalPlayer.PlayerScripts.ChildAdded:Connect(function(child)
                     if child.Name == "AFK" and child:IsA("LocalScript") then
                         child.Disabled = true
@@ -64,36 +98,95 @@ return function(deps)
                 end)
             end
         end)
+        disableIdledConnections()
+    end
+
+    function M.applyGameSpecificAFK()
+        if not afkState.enabled then afkState.enabled = true end
+
+        -- Steal A Pet And Ride It: AfkController reads this attribute every second and uses
+        -- it as RejoinAfter, so a huge value makes its own AFK loop never fire.
         pcall(function()
-            local idledConns = getconnections and getconnections(LocalPlayer.Idled)
-            if idledConns then
-                for _, conn in ipairs(idledConns) do
-                    if conn.Disable then conn:Disable() elseif conn.Disconnect then conn:Disconnect() end
-                end
+            if workspace:GetAttribute("TestAfk") ~= 1e9 then
+                workspace:SetAttribute("TestAfk", 1e9)
             end
         end)
     end
 
-    function M.triggerAntiAFK()
-        M.bypassGameAFK()
+    -- ---- generic input layers ----
+    local function fakeInputObject()
+        return {
+            UserInputType = Enum.UserInputType.MouseButton1,
+            UserInputState = Enum.UserInputState.Begin,
+            KeyCode = Enum.KeyCode.Unknown,
+            Position = Vector3.new(1, 1, 1),
+            Delta = Vector3.new(1, 1, 1),
+        }
+    end
+
+    local function replayInput()
+        -- firesignal is a real replay on Delta/Arceus; a silent no-op on Real. Harmless either way.
+        if typeof(firesignal) ~= "function" then return end
+        pcall(function() firesignal(UserInputService.InputBegan, fakeInputObject()) end)
+        pcall(function() firesignal(UserInputService.InputChanged, fakeInputObject()) end)
+        pcall(function() firesignal(UserInputService.InputEnded, fakeInputObject()) end)
+        pcall(function() firesignal(UserInputService.JumpRequest) end)
+    end
+
+    local function virtualInput()
         pcall(function()
             VirtualUser:CaptureController()
-            VirtualUser:ClickButton2(Vector2.new())
+            VirtualUser:ClickButton2(Vector2.new(1, 1))
         end)
-        pcall(function()
-            UserInputService.InputBegan:Fire({
-                UserInputType = Enum.UserInputType.MouseButton1,
-                UserInputState = Enum.UserInputState.Begin,
-                Position = Vector3.new(0, 0, 0),
-            }, false)
-        end)
-        local char = LocalPlayer.Character
-        if char then
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            if hum then
-                pcall(function() hum:Move(Vector3.new(0, 0, 0)) end)
-            end
+    end
+
+    function M.triggerAntiAFK()
+        afkState.enabled = true
+        M.bypassGameAFK()
+        M.applyGameSpecificAFK()
+        virtualInput()
+        replayInput()
+        disableIdledConnections()
+    end
+
+    function M.startAntiAFK(interval)
+        interval = tonumber(interval) or 30
+        afkState.enabled = true
+        M.bypassGameAFK()
+        M.applyGameSpecificAFK()
+
+        -- instant response when the engine reports us idle
+        if not afkState.idledConn then
+            pcall(function()
+                afkState.idledConn = LocalPlayer.Idled:Connect(function()
+                    if afkState.enabled then M.triggerAntiAFK() end
+                end)
+            end)
         end
+
+        if not afkState.running then
+            afkState.running = true
+            afkState.thread = task.spawn(function()
+                while afkState.running and afkState.enabled do
+                    M.triggerAntiAFK()
+                    task.wait(interval)
+                end
+                afkState.running = false
+            end)
+        end
+    end
+
+    function M.stopAntiAFK()
+        afkState.enabled = false
+        afkState.running = false
+        pcall(function()
+            if afkState.idledConn then
+                afkState.idledConn:Disconnect()
+                afkState.idledConn = nil
+            end
+        end)
+        -- let the game behave normally again when the user turns it off
+        pcall(function() workspace:SetAttribute("TestAfk", nil) end)
     end
 
     function M.setupAutoReconnect()
